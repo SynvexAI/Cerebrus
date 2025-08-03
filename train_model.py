@@ -8,8 +8,11 @@ EPOCHS = 30
 DATA_FILE = "dataset/chess_dataset.npz"
 MODEL_FILE = "Cerebrus.h5"
 
-def residual_block(x, filters, kernel_size):
+def residual_block(x, filters, kernel_size, change_filters=False):
     shortcut = x
+    if change_filters:
+        shortcut = layers.Conv2D(filters, 1, padding='same')(shortcut)
+        shortcut = layers.BatchNormalization()(shortcut)
     x = layers.Conv2D(filters, kernel_size, padding='same', activation='relu')(x)
     x = layers.BatchNormalization()(x)
     x = layers.Conv2D(filters, kernel_size, padding='same')(x)
@@ -24,7 +27,8 @@ def build_model():
 
     for _ in range(4):
         x = residual_block(x, 64, 3)
-    for _ in range(3):
+    x = residual_block(x, 128, 3, change_filters=True)
+    for _ in range(2):
         x = residual_block(x, 128, 3)
 
     x = layers.Flatten()(x)
