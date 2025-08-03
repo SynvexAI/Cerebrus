@@ -7,14 +7,16 @@ from pathlib import Path
 import random
 import io
 import zstandard as zstd
+import os
 
 STOCKFISH_PATH = "dataset/stockfish.exe"
 PGN_FILE = "dataset/lichess_db_standard_rated_2014-02.pgn.zst"
-OUTPUT_FILE = "dataset/chess_dataset.npz"
+OUTPUT_DIR = "dataset/chess_batches"
 EVAL_DEPTH = 12
-NUM_SELFPLAY_GAMES = 1000
-MAX_POSITIONS_FROM_PGN = 10000
-MAX_POSITIONS_SELFPLAY = 10000
+NUM_SELFPLAY_GAMES = 500
+MAX_POSITIONS_FROM_PGN = 5000
+MAX_POSITIONS_SELFPLAY = 5000
+BATCH_SIZE = 1000
 
 piece_map = {
     'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
@@ -39,24 +41,6 @@ def board_to_input_array(board):
     return arr
 
 
-def evaluate_position(fen):
-    board = chess.Board(fen)
-    with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as eng:
-        info = eng.analyse(board, chess.engine.Limit(depth=EVAL_DEPTH))
-        score = info.get("score").white().score(mate_score=100000) or 0
-    return score
-
-
-def process_chunk(fens):
-    Xc, yc = [], []
-    for fen in fens:
-        score = evaluate_position(fen)
-        norm = np.tanh(score / 1000.0)
-        Xc.append(board_to_input_array(chess.Board(fen)))
-        yc.append(norm)
-    return Xc, yc
-
-
 def extract_positions_from_pgn(pgn_path, max_positions):
     positions = []
     with open_pgn_stream(pgn_path) as f:
@@ -67,9 +51,8 @@ def extract_positions_from_pgn(pgn_path, max_positions):
             board = game.board()
             for move in game.mainline_moves():
                 board.push(move)
-                if board.is_game_over():
-                    break
-                positions.append(board.fen())
+                if 10 < board.fullmove_number < 60 and len(board.piece_map()) > 8:
+                    positions.append(board.fen())
                 if len(positions) >= max_positions:
                     break
     return positions
@@ -78,49 +61,72 @@ def extract_positions_from_pgn(pgn_path, max_positions):
 def generate_selfplay_positions(num_games, max_positions):
     positions = []
     with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
-        for g in range(num_games):
+        for _ in range(num_games):
             board = chess.Board()
             while not board.is_game_over() and len(positions) < max_positions:
                 result = engine.play(board, limit=chess.engine.Limit(depth=EVAL_DEPTH))
                 board.push(result.move)
-                positions.append(board.fen())
+                if 10 < board.fullmove_number < 60 and len(board.piece_map()) > 8:
+                    positions.append(board.fen())
             if len(positions) >= max_positions:
                 break
     return positions
 
 
-def generate_dataset(num_samples_pgn, num_games, samples_selfplay):
-    print("Извлечение позиций из PGN...")
-    pgn_fens = extract_positions_from_pgn(PGN_FILE, num_samples_pgn)
+def worker(fens):
+    X_batch, y_batch = [], []
+    with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine:
+        for fen in fens:
+            board = chess.Board(fen)
+            info = engine.analyse(board, chess.engine.Limit(depth=EVAL_DEPTH))
+            score = info["score"].white().score(mate_score=100000) or 0
+            norm = max(min(score / 600, 1), -1)
+            X_batch.append(board_to_input_array(board))
+            y_batch.append(norm)
+    return X_batch, y_batch
+
+
+def save_batch(X, y, batch_idx):
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    filename = os.path.join(OUTPUT_DIR, f"batch_{batch_idx}.npz")
+    np.savez_compressed(filename, X=np.array(X, dtype=np.float32), y=np.array(y, dtype=np.float32))
+    print(f"✅ Сохранено: {filename} ({len(X)} позиций)")
+
+
+def generate_dataset():
+    print("📥 Извлечение позиций из PGN...")
+    pgn_fens = extract_positions_from_pgn(PGN_FILE, MAX_POSITIONS_FROM_PGN)
     print(f"PGN-позиций: {len(pgn_fens)}")
 
-    print("Генерация позиций через self-play Stockfish vs Stockfish...")
-    selfplay_fens = generate_selfplay_positions(num_games, samples_selfplay)
+    print("♟ Генерация self-play позиций...")
+    selfplay_fens = generate_selfplay_positions(NUM_SELFPLAY_GAMES, MAX_POSITIONS_SELFPLAY)
     print(f"Self-play позиций: {len(selfplay_fens)}")
 
     fens = pgn_fens + selfplay_fens
     random.shuffle(fens)
-    print(f"Всего позиций для оценки: {len(fens)}")
+    print(f"Всего позиций: {len(fens)}")
 
     cpu = mp.cpu_count()
-    chunks = np.array_split(fens, cpu)
-    with mp.Pool(cpu) as pool:
-        results = pool.map(process_chunk, chunks)
+    pool = mp.Pool(cpu)
+    batch_idx = 0
 
-    X, y = [], []
-    for Xc, yc in results:
-        X.extend(Xc)
-        y.extend(yc)
+    for i in range(0, len(fens), BATCH_SIZE):
+        chunk = fens[i:i + BATCH_SIZE]
+        subchunks = np.array_split(chunk, cpu)
+        results = pool.map(worker, subchunks)
 
-    X = np.array(X, dtype=np.float32)
-    y = np.array(y, dtype=np.float32)
-    np.savez(OUTPUT_FILE, X=X, y=y)
-    print(f"Сохранено: {OUTPUT_FILE} (X: {X.shape}, y: {y.shape})")
+        X, y = [], []
+        for Xc, yc in results:
+            X.extend(Xc)
+            y.extend(yc)
+
+        save_batch(X, y, batch_idx)
+        batch_idx += 1
+
+    pool.close()
+    pool.join()
+    print("🎉 Генерация завершена! Все батчи сохранены в", OUTPUT_DIR)
 
 
 if __name__ == "__main__":
-    generate_dataset(
-        num_samples_pgn=MAX_POSITIONS_FROM_PGN,
-        num_games=NUM_SELFPLAY_GAMES,
-        samples_selfplay=MAX_POSITIONS_SELFPLAY
-    )
+    generate_dataset()
